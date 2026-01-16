@@ -2,7 +2,7 @@ services:
   converter:
     build: .
     ports:
-      - "8080:8080"
+      - "7000:7000"
     volumes:
       - ./data:/data
     restart: unless-stopped
