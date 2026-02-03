@@ -2,155 +2,385 @@ import os
 import shutil
 import subprocess
 import uuid
+import zipfile
 from pathlib import Path
+from dataclasses import dataclass
+from typing import List
+
+from PIL import Image, ImageOps
+from pillow_heif import register_heif_opener
 
 import gradio as gr
 
+# =============================
+# CONFIG
+# =============================
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 UPLOADS = DATA_DIR / "uploads"
 OUTPUTS = DATA_DIR / "outputs"
-UPLOADS.mkdir(parents=True, exist_ok=True)
-OUTPUTS.mkdir(parents=True, exist_ok=True)
+JOBS = DATA_DIR / "jobs"
 
+# Output folder can be a NAS mount (e.g., /mnt/nas/conversions)
+OUTPUT_ROOT = Path(os.environ.get("OUTPUT_ROOT", OUTPUTS))
+
+# Keep some free disk space to avoid filling the device
+SAFETY_MARGIN = 4 * 1024**3  # 4 GB
+
+for d in (UPLOADS, OUTPUTS, JOBS):
+    d.mkdir(parents=True, exist_ok=True)
+
+# Enable HEIC / HEIF support for Pillow
+register_heif_opener()
+
+# =============================
+# UTILS
+# =============================
 def run(cmd: list[str]) -> str:
+    """Run a command and return combined stdout/stderr. Raise on non-zero exit."""
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if p.returncode != 0:
-        raise RuntimeError(p.stdout)
-    return p.stdout
+        raise RuntimeError(p.stdout.strip())
+    return p.stdout or ""
 
-def convert(file_obj, target: str):
-    if file_obj is None:
-        return None, "❌ Aucun fichier", ""
+def free_space(path: Path) -> int:
+    """Free disk space in bytes for the filesystem containing 'path'."""
+    return shutil.disk_usage(path).free
 
-    src_path = Path(file_obj)
-    job_id = str(uuid.uuid4())[:8]
-    src_ext = src_path.suffix.lower().lstrip(".") or "bin"
+def safe_name(p: Path) -> str:
+    """Sanitize a filename stem to avoid weird characters."""
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in p.stem)
 
-    in_path = UPLOADS / f"{job_id}.{src_ext}"
-    shutil.copy(src_path, in_path)
+def ext(p: Path) -> str:
+    """Lowercase extension without the dot."""
+    return p.suffix.lower().lstrip(".")
 
-    # default output
-    out_path = OUTPUTS / f"{job_id}.{target}"
-
-    logs = ""
+def safe_unlink(p: Path) -> bool:
+    """Best-effort file delete."""
     try:
-        if target in ["png", "jpg", "webp", "tiff"]:
-            logs = run(["magick", str(in_path), str(out_path)])
+        if p.exists() and p.is_file():
+            p.unlink()
+            return True
+    except Exception:
+        pass
+    return False
 
-        elif target in ["mp4", "webm", "mp3", "wav", "mkv"]:
-            logs = run(["ffmpeg", "-y", "-i", str(in_path), str(out_path)])
+def clear_output(last_output_path: str):
+    """Clear only the last output file from disk and reset output UI."""
+    out_val = None
+    logs_val = ""
 
+    if last_output_path:
+        safe_unlink(Path(last_output_path))
+
+    return out_val, logs_val, ""
+
+def clear_all(last_output_path: str):
+    """Delete everything inside UPLOADS and OUTPUTS, then reset the UI."""
+    # Clean uploads
+    for p in UPLOADS.glob("**/*"):
+        try:
+            if p.is_file():
+                p.unlink()
+        except Exception:
+            pass
+
+    # Clean outputs
+    for p in OUTPUTS.glob("**/*"):
+        try:
+            if p.is_file():
+                p.unlink()
+        except Exception:
+            pass
+
+    # Reset UI: input, output, logs, last_output
+    return None, None, "", ""
+
+# =============================
+# CONVERSION MATRIX
+# =============================
+# For each input extension, list allowed targets.
+CONVERSION_MATRIX = {
+    "jpg": {"png", "webp", "tiff", "pdf"},
+    "jpeg": {"png", "webp", "tiff", "pdf"},
+    "png": {"jpg", "webp", "tiff", "pdf"},
+    "webp": {"png", "jpg", "tiff"},
+    "tiff": {"png", "jpg", "webp"},
+
+    # HEIC / HEIF
+    "heic": {"jpg", "jpeg", "png", "webp", "tiff", "pdf"},
+    "heif": {"jpg", "jpeg", "png", "webp", "tiff", "pdf"},
+
+    "mp4": {"webm", "mp3", "wav", "mkv"},
+    "mkv": {"mp4", "webm", "mp3", "wav"},
+    "mp3": {"wav"},
+    "wav": {"mp3"},
+
+    "doc": {"pdf"},
+    "docx": {"pdf"},
+    "ppt": {"pdf"},
+    "pptx": {"pdf"},
+    "xls": {"pdf"},
+    "xlsx": {"pdf"},
+    "odt": {"pdf"},
+    "ods": {"pdf"},
+    "odp": {"pdf"},
+
+    "pdf": {"ocrpdf", "png", "jpg"},
+}
+
+# =============================
+# FILE TASK
+# =============================
+@dataclass
+class FileTask:
+    path: Path
+    size: int
+    ext: str
+
+# =============================
+# CONVERTERS
+# =============================
+def heic_to_image(in_path: Path, out_path: Path, target: str) -> str:
+    """Convert HEIC/HEIF to common image formats (or PDF)."""
+    with Image.open(in_path) as img:
+        # Fix iPhone-style EXIF orientation
+        img = ImageOps.exif_transpose(img)
+
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+
+        if target in {"jpg", "jpeg"}:
+            img.save(out_path, "JPEG", quality=95)
+        elif target == "png":
+            img.save(out_path, "PNG")
+        elif target == "webp":
+            img.save(out_path, "WEBP", quality=95)
+        elif target == "tiff":
+            img.save(out_path, "TIFF")
         elif target == "pdf":
-            tmp_out_dir = OUTPUTS / f"{job_id}_lo"
-            tmp_out_dir.mkdir(parents=True, exist_ok=True)
-
-            logs = run([
-                "soffice", "--headless", "--nologo", "--nofirststartwizard",
-                "--convert-to", "pdf",
-                "--outdir", str(tmp_out_dir),
-                str(in_path)
-            ])
-            produced = next(tmp_out_dir.glob("*.pdf"), None)
-            if not produced:
-                raise RuntimeError("LibreOffice n'a pas généré de PDF.")
-            shutil.move(str(produced), str(out_path))
-            shutil.rmtree(tmp_out_dir, ignore_errors=True)
-
-        elif target == "ocrpdf":
-            out_path = OUTPUTS / f"{job_id}.pdf"
-            logs = run(["ocrmypdf", "--skip-text", str(in_path), str(out_path)])
-
+            # Save a temp JPEG then wrap into PDF via ImageMagick
+            tmp_img = out_path.with_suffix(".jpg")
+            img.save(tmp_img, "JPEG", quality=95)
+            run(["magick", str(tmp_img), str(out_path)])
+            tmp_img.unlink()
         else:
-            raise RuntimeError(f"Conversion vers '{target}' non supportée.")
+            raise RuntimeError("Unsupported HEIC output format")
 
-        return str(out_path), f"✅ Terminé: {out_path.name}", logs
+    return "HEIC conversion OK"
 
+def convert_one(in_path: Path, out_path: Path, target: str) -> str:
+    """Convert one file to the desired target format."""
+    input_ext = ext(in_path)
+
+    # HEIC / HEIF handled by Pillow
+    if input_ext in {"heic", "heif"}:
+        return heic_to_image(in_path, out_path, target)
+
+    # Images via ImageMagick
+    if target in {"png", "jpg", "jpeg", "webp", "tiff"}:
+        return run(["magick", str(in_path), str(out_path)])
+
+    # Audio/video via FFmpeg
+    if target in {"mp4", "webm", "mp3", "wav", "mkv"}:
+        return run(["ffmpeg", "-y", "-i", str(in_path), str(out_path)])
+
+    # Office documents to PDF via LibreOffice
+    if target == "pdf":
+        tmp = out_path.parent / f"{out_path.stem}_lo"
+        tmp.mkdir(exist_ok=True)
+        logs = run([
+            "soffice", "--headless", "--nologo", "--nofirststartwizard",
+            "--convert-to", "pdf",
+            "--outdir", str(tmp),
+            str(in_path)
+        ])
+        produced = next(tmp.glob("*.pdf"), None)
+        if not produced:
+            raise RuntimeError("LibreOffice produced no output")
+        shutil.move(produced, out_path)
+        shutil.rmtree(tmp, ignore_errors=True)
+        return logs
+
+    # OCR on PDF via OCRmyPDF
+    if target == "ocrpdf":
+        return run(["ocrmypdf", "--skip-text", str(in_path), str(out_path)])
+
+    raise RuntimeError("Missing converter for this target")
+
+# =============================
+# BATCH PLANNER
+# =============================
+def make_batches(files: List[FileTask]) -> List[List[FileTask]]:
+    """Create batches that fit within available disk space (minus safety margin)."""
+    batches: List[List[FileTask]] = []
+    remaining = files[:]
+
+    while remaining:
+        usable = free_space(DATA_DIR) - SAFETY_MARGIN
+        if usable <= 0:
+            raise RuntimeError("Insufficient disk space")
+
+        batch: List[FileTask] = []
+        used = 0
+
+        for f in remaining:
+            if used + f.size > usable:
+                break
+            batch.append(f)
+            used += f.size
+
+        if not batch:
+            raise RuntimeError("A file is too large for the available disk space")
+
+        batches.append(batch)
+        remaining = remaining[len(batch):]
+
+    return batches
+
+# =============================
+# MAIN CONVERT FUNCTION
+# =============================
+def convert(file_obj, target: str):
+    """Handle single file or ZIP input, convert compatible files, zip outputs if needed."""
+    logs: List[str] = []
+    outputs: List[Path] = []
+
+    if file_obj is None:
+        return None, "❌ No file provided", ""
+
+    src = Path(file_obj)
+
+    # Normalize input into tasks
+    tasks: List[FileTask] = []
+    extract_dir: Path | None = None
+
+    if src.suffix.lower() == ".zip":
+        extract_dir = UPLOADS / f"zip_{uuid.uuid4().hex[:6]}"
+        extract_dir.mkdir()
+        with zipfile.ZipFile(src) as z:
+            z.extractall(extract_dir)
+        for p in extract_dir.rglob("*"):
+            if p.is_file():
+                tasks.append(FileTask(p, p.stat().st_size, ext(p)))
+    else:
+        if not src.exists():
+            return None, "❌ Uploaded file is missing (temporary path). Please re-upload.", ""
+        tasks.append(FileTask(src, src.stat().st_size, ext(src)))
+
+    # Filter out non-convertible files (do not block the rest)
+    valid: List[FileTask] = []
+    for t in tasks:
+        if t.ext not in CONVERSION_MATRIX or target not in CONVERSION_MATRIX[t.ext]:
+            logs.append(f"❌ Skipped (not compatible): {t.path.name}")
+            safe_unlink(t.path)
+        else:
+            valid.append(t)
+
+    if not valid:
+        # Cleanup extracted zip folder
+        if extract_dir:
+            shutil.rmtree(extract_dir, ignore_errors=True)
+        return None, "\n".join(logs), ""
+
+    # Plan batches based on available disk space
+    try:
+        batches = make_batches(valid)
     except Exception as e:
-        return None, f"❌ Erreur: {e}", logs
+        if extract_dir:
+            shutil.rmtree(extract_dir, ignore_errors=True)
+        return None, f"❌ {e}", ""
 
+    # Process batches
+    for batch in batches:
+        for f in batch:
+            job = uuid.uuid4().hex[:8]
+            in_path = UPLOADS / f"{safe_name(f.path)}_{job}.{f.ext}"
+            shutil.copy(f.path, in_path)
 
+            out_ext = "pdf" if target == "ocrpdf" else target
+            out_path = OUTPUT_ROOT / f"{safe_name(f.path)}_{job}.{out_ext}"
+
+            try:
+                logs.append(f"▶ Processing: {f.path.name}")
+                logs.append(convert_one(in_path, out_path, target))
+                outputs.append(out_path)
+            except Exception as e:
+                logs.append(f"❌ Error {f.path.name}: {e}")
+            finally:
+                safe_unlink(in_path)
+                safe_unlink(f.path)
+
+    # Zip outputs if multiple
+    if len(outputs) == 1:
+        result = outputs[0]
+    else:
+        zip_out = OUTPUT_ROOT / f"results_{uuid.uuid4().hex[:6]}.zip"
+        with zipfile.ZipFile(zip_out, "w", zipfile.ZIP_DEFLATED) as z:
+            for o in outputs:
+                z.write(o, o.name)
+                safe_unlink(o)
+        result = zip_out
+
+    # Cleanup extracted zip folder
+    if extract_dir:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+
+    return str(result), "\n".join(logs), str(result)
+
+# =============================
+# UI
+# =============================
 CSS = """
-/* Largeur globale */
 .gradio-container { max-width: 1200px !important; }
+.frame { padding: 12px !important; background: #fff; min-height: 260px; }
+.center-panel { padding: 12px !important; background: #fff; min-height: 260px; display:flex; flex-direction:column; gap:12px; }
+.convert-btn button { height:56px!important; font-size:18px!important; font-weight:700!important; }
+.logs-frame { padding:12px!important; background:#fff; }
 
-/* Titres des "blocs" style encadré */
-.block-title {
-  font-size: 18px;
-  font-weight: 600;
-  margin-bottom: 8px;
+#clear_btn button,
+#clear_btn .gr-button,
+#clear_btn button:hover,
+#clear_btn .gr-button:hover {
+  height:56px!important;
+  font-size:18px!important;
+  font-weight:700!important;
+  background:#ff0000!important;
+  color:#ffffff!important;
+  border:1px solid #ff0000!important;
 }
-
-/* Cadres épais type schéma */
-.frame {
-  padding: 12px !important;
-  background: #fff;
-  min-height: 260px;
-}
-
-/* Colonne centrale compacte */
-.center-panel {
-  padding: 12px !important;
-  background: #fff;
-  min-height: 260px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  justify-content: flex-start;
-}
-
-/* Gros bouton conversion */
-.convert-btn button {
-  height: 56px !important;
-  font-size: 18px !important;
-  font-weight: 700 !important;
-}
-
-/* Zone logs */
-.logs-frame {
-  padding: 12px !important;
-  background: #fff;
-}
-
-/* Responsive : sur mobile on empile */
-@media (max-width: 900px) {
-  .gradio-container { max-width: 95vw !important; }
+#clear_btn button:hover,
+#clear_btn .gr-button:hover {
+  background:#cc0000!important;
 }
 """
 
 with gr.Blocks(css=CSS, title="File Converter") as demo:
-    gr.Markdown("## Convertisseur de fichiers", elem_id="title")
+    last_output = gr.State("")
 
-    # Top row: left | center | right
+    gr.Markdown("## File Converter")
+
     with gr.Row(equal_height=True):
-        # LEFT
         with gr.Column(scale=5, elem_classes=["frame"]):
-            #gr.Markdown("**Fichier / dossier**", elem_classes=["block-title"])
-            inp = gr.File(label="Dépose un fichier", file_count="single")
+            inp = gr.File(label="Drop a file or a ZIP", file_count="single")
 
-        # CENTER
         with gr.Column(scale=2, elem_classes=["center-panel"]):
-            #gr.Markdown("**Format de sortie**", elem_classes=["block-title"])
             target = gr.Dropdown(
-                label="Format de sortie",
-                choices=["png","jpg","webp","tiff","mp4","webm","mp3","wav","mkv","pdf","ocrpdf"],
+                label="Output format",
+                choices=sorted({t for v in CONVERSION_MATRIX.values() for t in v}),
                 value="pdf"
             )
-            btn = gr.Button("➡ Convertir", elem_classes=["convert-btn"])
-            #status = gr.Textbox(label="Statut", lines=2)
+            btn = gr.Button("➡ Convert", elem_classes=["convert-btn"])
+            clear_btn = gr.Button("Clear", elem_id="clear_btn")
 
-        # RIGHT
         with gr.Column(scale=5, elem_classes=["frame"]):
-            #gr.Markdown("**Fichier / dossier convertis**", elem_classes=["block-title"])
-            out_file = gr.File(label="Résultat")
+            out_file = gr.File(label="Result")
 
-    # Bottom logs
     with gr.Row():
         with gr.Column(elem_classes=["logs-frame"]):
-            #gr.Markdown("**Logs**", elem_classes=["block-title"])
             logs = gr.Textbox(label="Logs", lines=10)
 
-    # btn.click(convert, inputs=[inp, target], outputs=[out_file, status, logs])
-    btn.click(convert, inputs=[inp, target], outputs=[out_file, logs])
+    btn.click(convert, inputs=[inp, target], outputs=[out_file, logs, last_output])
+    clear_btn.click(clear_all, inputs=[last_output], outputs=[inp, out_file, logs, last_output])
 
 if __name__ == "__main__":
     demo.launch(

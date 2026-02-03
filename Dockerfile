@@ -48,7 +48,11 @@ RUN pip install --no-cache-dir \
     "gradio==4.44.1" \
     "gradio-client==1.3.0" \
     "fastapi==0.112.2" \
-    "pydantic==2.8.2"
+    "pydantic==2.8.2" \
+    "pillow==10.4.0"\
+    "pillow-heif==0.20.0"
+
+     
 
 # Optionnel: outils dev
 RUN pip install --no-cache-dir watchdog
