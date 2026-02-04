@@ -26,6 +26,9 @@ OUTPUT_ROOT = Path(os.environ.get("OUTPUT_ROOT", OUTPUTS))
 # Keep some free disk space to avoid filling the device
 SAFETY_MARGIN = 4 * 1024**3  # 4 GB
 
+# Conservative estimate: output + temp files can be larger than input
+OUTPUT_MULTIPLIER = 2.0
+
 for d in (UPLOADS, OUTPUTS, JOBS):
     d.mkdir(parents=True, exist_ok=True)
 
@@ -64,6 +67,31 @@ def safe_unlink(p: Path) -> bool:
         pass
     return False
 
+def to_paths(file_obj) -> List[Path]:
+    """
+    Gradio can return:
+      - a string path
+      - an object with .name
+      - a list of either of the above when file_count="multiple"
+    """
+    if file_obj is None:
+        return []
+    if isinstance(file_obj, list):
+        out: List[Path] = []
+        for f in file_obj:
+            if isinstance(f, str):
+                out.append(Path(f))
+            elif hasattr(f, "name"):
+                out.append(Path(f.name))
+            else:
+                raise RuntimeError(f"Unknown upload type: {type(f)}")
+        return out
+    if isinstance(file_obj, str):
+        return [Path(file_obj)]
+    if hasattr(file_obj, "name"):
+        return [Path(file_obj.name)]
+    raise RuntimeError(f"Unknown upload type: {type(file_obj)}")
+
 def clear_output(last_output_path: str):
     """Clear only the last output file from disk and reset output UI."""
     out_val = None
@@ -76,7 +104,6 @@ def clear_output(last_output_path: str):
 
 def clear_all(last_output_path: str):
     """Delete everything inside UPLOADS and OUTPUTS, then reset the UI."""
-    # Clean uploads
     for p in UPLOADS.glob("**/*"):
         try:
             if p.is_file():
@@ -84,7 +111,6 @@ def clear_all(last_output_path: str):
         except Exception:
             pass
 
-    # Clean outputs
     for p in OUTPUTS.glob("**/*"):
         try:
             if p.is_file():
@@ -158,7 +184,6 @@ def heic_to_image(in_path: Path, out_path: Path, target: str) -> str:
         elif target == "tiff":
             img.save(out_path, "TIFF")
         elif target == "pdf":
-            # Save a temp JPEG then wrap into PDF via ImageMagick
             tmp_img = out_path.with_suffix(".jpg")
             img.save(tmp_img, "JPEG", quality=95)
             run(["magick", str(tmp_img), str(out_path)])
@@ -211,23 +236,27 @@ def convert_one(in_path: Path, out_path: Path, target: str) -> str:
 # BATCH PLANNER
 # =============================
 def make_batches(files: List[FileTask]) -> List[List[FileTask]]:
-    """Create batches that fit within available disk space (minus safety margin)."""
+    """
+    Create batches that fit within available disk space (minus safety margin).
+    We estimate disk usage as input_size * OUTPUT_MULTIPLIER to account for outputs/temp files.
+    """
     batches: List[List[FileTask]] = []
     remaining = files[:]
 
     while remaining:
         usable = free_space(DATA_DIR) - SAFETY_MARGIN
         if usable <= 0:
-            raise RuntimeError("Insufficient disk space")
+            raise RuntimeError("Insufficient disk space (after safety margin)")
 
         batch: List[FileTask] = []
         used = 0
 
         for f in remaining:
-            if used + f.size > usable:
+            est = int(f.size * OUTPUT_MULTIPLIER)
+            if used + est > usable:
                 break
             batch.append(f)
-            used += f.size
+            used += est
 
         if not batch:
             raise RuntimeError("A file is too large for the available disk space")
@@ -241,33 +270,81 @@ def make_batches(files: List[FileTask]) -> List[List[FileTask]]:
 # MAIN CONVERT FUNCTION
 # =============================
 def convert(file_obj, target: str):
-    """Handle single file or ZIP input, convert compatible files, zip outputs if needed."""
     logs: List[str] = []
     outputs: List[Path] = []
 
-    if file_obj is None:
-        return None, "❌ No file provided", ""
+    sources = to_paths(file_obj)
+    if not sources:
+        return None, "❌ No files provided", ""
 
-    src = Path(file_obj)
+    # -----------------------------
+    # STORAGE GUARD (Solution A)
+    # If user uploads too much at once, delete uploads and ask for smaller batches.
+    # -----------------------------
+    total_size = 0
+    existing_sources: List[Path] = []
+    for p in sources:
+        if p.exists() and p.is_file():
+            existing_sources.append(p)
+            total_size += p.stat().st_size
 
-    # Normalize input into tasks
+    available = free_space(DATA_DIR) - SAFETY_MARGIN
+    if total_size > available:
+        # Free space ASAP: delete uploaded files
+        for p in existing_sources:
+            safe_unlink(p)
+
+        msg = (
+            "❌ Upload too large: the selected files exceed the available storage on this device.\n"
+            f"   - Selected: {total_size/1024**3:.2f} GB\n"
+            f"   - Available (after safety margin): {max(available, 0)/1024**3:.2f} GB\n"
+            "✅ Please upload fewer files (smaller batch) and try again."
+        )
+        return None, msg, ""
+
     tasks: List[FileTask] = []
-    extract_dir: Path | None = None
+    extract_dirs: List[Path] = []
 
-    if src.suffix.lower() == ".zip":
-        extract_dir = UPLOADS / f"zip_{uuid.uuid4().hex[:6]}"
-        extract_dir.mkdir()
-        with zipfile.ZipFile(src) as z:
-            z.extractall(extract_dir)
-        for p in extract_dir.rglob("*"):
-            if p.is_file():
-                tasks.append(FileTask(p, p.stat().st_size, ext(p)))
-    else:
+    # Build tasks list from multiple sources
+    for src in sources:
         if not src.exists():
-            return None, "❌ Uploaded file is missing (temporary path). Please re-upload.", ""
-        tasks.append(FileTask(src, src.stat().st_size, ext(src)))
+            logs.append(f"❌ Missing upload (temporary file): {src}")
+            continue
 
-    # Filter out non-convertible files (do not block the rest)
+        if src.suffix.lower() == ".zip":
+            # Optional: refuse too-large zip extraction based on uncompressed size
+            try:
+                with zipfile.ZipFile(src) as z:
+                    uncompressed = sum(i.file_size for i in z.infolist())
+                if uncompressed > (free_space(DATA_DIR) - SAFETY_MARGIN):
+                    logs.append(
+                        "❌ ZIP extraction too large for available storage. "
+                        "Please split your ZIP into smaller parts and try again."
+                    )
+                    safe_unlink(src)
+                    continue
+            except Exception:
+                # If we cannot inspect the zip safely, we proceed but still handle failures later.
+                pass
+
+            extract_dir = UPLOADS / f"zip_{uuid.uuid4().hex[:6]}"
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            extract_dirs.append(extract_dir)
+
+            with zipfile.ZipFile(src) as z:
+                z.extractall(extract_dir)
+
+            for p in extract_dir.rglob("*"):
+                if p.is_file():
+                    tasks.append(FileTask(p, p.stat().st_size, ext(p)))
+
+            # Delete the uploaded ZIP itself to free space ASAP
+            safe_unlink(src)
+
+        else:
+            tasks.append(FileTask(src, src.stat().st_size, ext(src)))
+
+    # Filter non-convertible (delete immediately, but do not block others)
     valid: List[FileTask] = []
     for t in tasks:
         if t.ext not in CONVERSION_MATRIX or target not in CONVERSION_MATRIX[t.ext]:
@@ -277,17 +354,16 @@ def convert(file_obj, target: str):
             valid.append(t)
 
     if not valid:
-        # Cleanup extracted zip folder
-        if extract_dir:
-            shutil.rmtree(extract_dir, ignore_errors=True)
+        for d in extract_dirs:
+            shutil.rmtree(d, ignore_errors=True)
         return None, "\n".join(logs), ""
 
-    # Plan batches based on available disk space
+    # Batch plan
     try:
         batches = make_batches(valid)
     except Exception as e:
-        if extract_dir:
-            shutil.rmtree(extract_dir, ignore_errors=True)
+        for d in extract_dirs:
+            shutil.rmtree(d, ignore_errors=True)
         return None, f"❌ {e}", ""
 
     # Process batches
@@ -295,7 +371,10 @@ def convert(file_obj, target: str):
         for f in batch:
             job = uuid.uuid4().hex[:8]
             in_path = UPLOADS / f"{safe_name(f.path)}_{job}.{f.ext}"
+
+            # Copy into our working area then delete the original ASAP
             shutil.copy(f.path, in_path)
+            safe_unlink(f.path)
 
             out_ext = "pdf" if target == "ocrpdf" else target
             out_path = OUTPUT_ROOT / f"{safe_name(f.path)}_{job}.{out_ext}"
@@ -308,7 +387,6 @@ def convert(file_obj, target: str):
                 logs.append(f"❌ Error {f.path.name}: {e}")
             finally:
                 safe_unlink(in_path)
-                safe_unlink(f.path)
 
     # Zip outputs if multiple
     if len(outputs) == 1:
@@ -321,9 +399,9 @@ def convert(file_obj, target: str):
                 safe_unlink(o)
         result = zip_out
 
-    # Cleanup extracted zip folder
-    if extract_dir:
-        shutil.rmtree(extract_dir, ignore_errors=True)
+    # Cleanup extracted dirs
+    for d in extract_dirs:
+        shutil.rmtree(d, ignore_errors=True)
 
     return str(result), "\n".join(logs), str(result)
 
@@ -361,13 +439,13 @@ with gr.Blocks(css=CSS, title="File Converter") as demo:
 
     with gr.Row(equal_height=True):
         with gr.Column(scale=5, elem_classes=["frame"]):
-            inp = gr.File(label="Drop a file or a ZIP", file_count="single")
+            inp = gr.File(label="Drop files or ZIPs", file_count="multiple")
 
         with gr.Column(scale=2, elem_classes=["center-panel"]):
             target = gr.Dropdown(
                 label="Output format",
                 choices=sorted({t for v in CONVERSION_MATRIX.values() for t in v}),
-                value="pdf"
+                value="pdf",
             )
             btn = gr.Button("➡ Convert", elem_classes=["convert-btn"])
             clear_btn = gr.Button("Clear", elem_id="clear_btn")
@@ -388,5 +466,5 @@ if __name__ == "__main__":
         server_port=7000,
         share=False,
         show_api=False,
-        quiet=True
+        quiet=True,
     )
